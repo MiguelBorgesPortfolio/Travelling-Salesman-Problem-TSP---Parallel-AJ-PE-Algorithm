@@ -1,0 +1,370 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/shm.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <signal.h>
+
+#define MAX_LINE_LENGTH 100
+#define SHM_KEY 1234
+#define SEM_KEY 5678
+#define BEST_TIME_SHM_KEY 7890
+
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+    struct seminfo *__buf;
+};
+
+typedef struct {
+    int cities;
+    int *path;
+    double distance;
+    int bestIteration;
+    int iterationCount;
+    int updated;
+} Path;
+
+int **distances;
+int semid;
+double *bestTimePtr;
+
+key_t createSharedMemory();
+key_t createBestTimeSharedMemory();
+void initSemaphore();
+double calculateDistance(Path *path);
+void waitForChildProcesses(int numProcesses);
+void freePathMemory(Path *path);
+void printBestPath(Path *path);
+void initializePathWithDistances(Path *path, int numCities);
+void readSquareMatrixFromFile(const char *filename, int *size, int ***matrix);
+void waitSemaphore();
+void signalSemaphore();
+void exchangeMutation(Path *path);
+void executeAlgorithm(Path *sharedMemory, int maxTime, double *bestTimePtr);
+void updateChildProcesses(Path *sharedMemory, int numProcesses);
+void handleUpdateSignal(int signo);
+void createChildProcesses(int numProcesses, Path *sharedMemory, int maxTime);
+int main(int argc, char *argv[]);
+
+key_t createSharedMemory() {
+    key_t key = ftok("/tmp", 'R');
+    if (key == -1) {
+        perror("ftok");
+        exit(EXIT_FAILURE);
+    }
+
+    int shmid = shmget(key, sizeof(Path), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        perror("shmget");
+        exit(EXIT_FAILURE);
+    }
+
+    return key;
+}
+
+key_t createBestTimeSharedMemory() {
+    key_t key = ftok("/tmp", 'B');
+    if (key == -1) {
+        perror("ftok");
+        exit(EXIT_FAILURE);
+    }
+
+    int shmid = shmget(key, sizeof(double), IPC_CREAT | 0666);
+    if (shmid == -1) {
+        perror("shmget");
+        exit(EXIT_FAILURE);
+    }
+
+    return key;
+}
+
+void initSemaphore() {
+    semid = semget(SEM_KEY, 1, IPC_CREAT | 0666);
+    if (semid == -1) {
+        perror("semget");
+        exit(EXIT_FAILURE);
+    }
+
+    union semun arg;
+    arg.val = 1;
+    if (semctl(semid, 0, SETVAL, arg) == -1) {
+        perror("semctl");
+        exit(EXIT_FAILURE);
+    }
+}
+
+double calculateDistance(Path *path) {
+    double totalDistance = 0.0;
+
+    for (int i = 0; i < path->cities - 1; ++i) {
+        int city1 = path->path[i];
+        int city2 = path->path[i + 1];
+        totalDistance += distances[city1][city2];
+    }
+
+    totalDistance += distances[path->path[path->cities - 1]][path->path[0]];
+
+    return totalDistance;
+}
+
+void waitForChildProcesses(int numProcesses) {
+    int status;
+    for (int i = 0; i < numProcesses; ++i) {
+        wait(&status);
+        if (!WIFEXITED(status)) {
+            fprintf(stderr, "Erro ou interrupção no processo filho\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void freePathMemory(Path *path) {
+    free(path->path);
+}
+
+void printBestPath(Path *path) {
+    printf("Melhor caminho: {");
+    for (int i = 0; i < path->cities; ++i) {
+        printf("%d", path->path[i] + 1);
+        if (i < path->cities - 1) {
+            printf(" -> ");
+        }
+    }
+    printf("}\n\n");
+}
+
+void initializePathWithDistances(Path *path, int numCities) {
+    path->cities = numCities;
+    path->distance = 0;
+
+    path->path = malloc((numCities + 1) * sizeof(int));
+    if (!path->path) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < numCities; ++i) {
+        path->path[i] = i;
+    }
+
+    for (int i = numCities - 1; i > 0; --i) {
+        int j = rand() % (i + 1);
+        int temp = path->path[i];
+        path->path[i] = path->path[j];
+        path->path[j] = temp;
+    }
+
+    path->path[numCities] = path->path[0];
+
+    path->distance = calculateDistance(path);
+}
+
+void readSquareMatrixFromFile(const char *filename, int *size, int ***matrix) {
+    FILE *file = fopen(filename, "r");
+
+    if (file == NULL) {
+        fprintf(stderr, "Erro ao abrir o arquivo.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    fscanf(file, "%d", size);
+
+    *matrix = (int **)malloc(*size * sizeof(int *));
+    for (int i = 0; i < *size; i++) {
+        (*matrix)[i] = (int *)malloc(*size * sizeof(int));
+    }
+
+    printf("\nMatriz de distâncias lida do arquivo:\n");
+    for (int i = 0; i < *size; i++) {
+        for (int j = 0; j < *size; j++) {
+            fscanf(file, "%d", &(*matrix)[i][j]);
+            printf("%d ", (*matrix)[i][j]);
+        }
+        printf("\n");
+    }
+
+    fclose(file);
+}
+
+void waitSemaphore() {
+    struct sembuf sops;
+    sops.sem_num = 0;
+    sops.sem_op = -1;
+    sops.sem_flg = 0;
+    if (semop(semid, &sops, 1) == -1) {
+        perror("semop");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void signalSemaphore() {
+    struct sembuf sops;
+    sops.sem_num = 0;
+    sops.sem_op = 1;
+    sops.sem_flg = 0;
+    if (semop(semid, &sops, 1) == -1) {
+        perror("semop");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void exchangeMutation(Path *path) {
+    int pos = rand() % (path->cities - 1);
+
+    int temp = path->path[pos];
+    path->path[pos] = path->path[(pos + 1) % path->cities];
+    path->path[(pos + 1) % path->cities] = temp;
+
+    path->distance = calculateDistance(path);
+
+    waitSemaphore();
+
+    path->updated = 1;
+
+    signalSemaphore();
+}
+
+void executeAlgorithm(Path *sharedMemory, int maxTime, double *bestTimePtr) {
+    struct timeval startTime, currentTime;
+
+    gettimeofday(&startTime, NULL);
+
+    int iterations = 0;
+    double bestTime = 0.0;
+
+    while (1) {
+        Path currentPath;
+        memcpy(&currentPath, sharedMemory, sizeof(Path));
+
+        exchangeMutation(&currentPath);
+
+        double newDistance = calculateDistance(&currentPath);
+
+        waitSemaphore();
+
+        if (newDistance < sharedMemory->distance) {
+            memcpy(sharedMemory, &currentPath, sizeof(Path));
+            sharedMemory->bestIteration = iterations;
+            gettimeofday(&currentTime, NULL);
+            *bestTimePtr = (double)(currentTime.tv_sec - startTime.tv_sec) + (double)(currentTime.tv_usec - startTime.tv_usec) / 1000000.0;
+            printBestPath(sharedMemory);
+            sharedMemory->updated = 1;
+        }
+        iterations++;
+
+        signalSemaphore();
+
+        gettimeofday(&currentTime, NULL);
+        if ((currentTime.tv_sec - startTime.tv_sec) >= maxTime) {
+            break;
+        }
+    }
+    sharedMemory->iterationCount += iterations;
+}
+
+void updateChildProcesses(Path *sharedMemory, int numProcesses) {
+    waitSemaphore();
+
+    sharedMemory->updated = 0;
+
+    signalSemaphore();
+
+    for (int i = 0; i < numProcesses; ++i) {
+        kill(sharedMemory->path[i], SIGUSR1);
+    }
+}
+
+void handleUpdateSignal(int signo) {
+
+}
+
+void createChildProcesses(int numProcesses, Path *sharedMemory, int maxTime) {
+    pid_t pid;
+    struct sigaction sa;
+
+    sa.sa_handler = handleUpdateSignal;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    for (int i = 0; i < numProcesses; ++i) {
+        pid = fork();
+        if (pid == -1) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) {
+            srand(getpid());
+            executeAlgorithm(sharedMemory, maxTime, bestTimePtr);
+            exit(EXIT_SUCCESS);
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 4) {
+        fprintf(stderr, "Uso: %s <arquivo_matriz_distancias> <num_processos> <tempo_maximo>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    const char *filename = argv[1];
+    int size;
+    int **matrix;
+
+    readSquareMatrixFromFile(filename, &size, &matrix);
+    printf("\n - - - Soluções Encontradas - - - \n");
+    distances = matrix;
+
+    key_t shmKey = createSharedMemory();
+    initSemaphore();
+    Path *sharedMemory = (Path *)shmat(shmget(shmKey, sizeof(Path), IPC_CREAT | 0666), NULL, 0);
+    if (sharedMemory == (Path *)-1) {
+        perror("shmat");
+        exit(EXIT_FAILURE);
+    }
+
+    key_t bestTimeShmKey = createBestTimeSharedMemory();
+    bestTimePtr = (double *)shmat(shmget(bestTimeShmKey, sizeof(double), IPC_CREAT | 0666), NULL, 0);
+    if (bestTimePtr == (double *)-1) {
+        perror("shmat");
+        exit(EXIT_FAILURE);
+    }
+
+    initializePathWithDistances(sharedMemory, size);
+
+    int numProcesses = atoi(argv[2]);
+    int maxTime = atoi(argv[3]);
+    struct timeval tvi, tvf, tv_res;
+
+    gettimeofday(&tvi, NULL);
+    createChildProcesses(numProcesses, sharedMemory, maxTime);
+
+    waitForChildProcesses(numProcesses);
+    gettimeofday(&tvf, NULL);
+
+    timersub(&tvf, &tvi, &tv_res);
+
+    printf("\nMelhor solução encontrada: %f\n", sharedMemory->distance);
+    printf("Iteração em que a melhor solução foi encontrada: %d\n", sharedMemory->bestIteration);
+    printf("Número total de iterações: %d\n", sharedMemory->iterationCount);
+    printf("Tempo de execução: %ld.%03ld seconds\n", (long)tv_res.tv_sec, (long)tv_res.tv_usec / 1000);
+    printf("Melhor tempo: %f seconds\n", *bestTimePtr);
+
+    for (int i = 0; i < size; ++i) {
+        free(distances[i]);
+    }
+    free(distances);
+
+    freePathMemory(sharedMemory);
+
+    shmdt(sharedMemory);
+    shmctl(shmget(shmKey, sizeof(Path), 0), IPC_RMID, NULL);
+
+    return EXIT_SUCCESS;
+}
